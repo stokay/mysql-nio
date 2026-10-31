@@ -1,6 +1,7 @@
 import Logging
 @testable import MySQLNIO
 import NIOCore
+import NIOEmbedded
 import NIOPosix
 import Testing
 import XCTest
@@ -400,6 +401,145 @@ struct MySQLNIOTests {
             try? await connection.close().get() // connection is *only* open if we get to this point
         }
         try? await serverChannel.close(mode: .all)
+    }
+
+    @Test
+    func tlsNotOfferedByServer() async throws {
+        // The greeting comes before TLS can start, so anyone on the path can remove CLIENT_SSL from it. A client that asked for TLS must
+        // then give up before sending its login, not send it in plaintext. A mock server records everything the client sends.
+        let received = MultiThreadedEventLoopGroup.singleton.any().makePromise(of: ByteBuffer.self)
+        let serverChannel = try await ServerBootstrap(group: .singletonMultiThreadedEventLoopGroup)
+            .childChannelInitializer { channel in
+                final class Handler: ChannelInboundHandler {
+                    typealias InboundIn = ByteBuffer; typealias OutboundOut = ByteBuffer
+                    let received: EventLoopPromise<ByteBuffer>
+                    var bytes = ByteBuffer()
+                    init(received: EventLoopPromise<ByteBuffer>) { self.received = received }
+                    func channelActive(context: ChannelHandlerContext) {
+                        let capabilities: MySQLProtocol.CapabilityFlags = [.CLIENT_LONG_PASSWORD, .CLIENT_PROTOCOL_41, .CLIENT_SECURE_CONNECTION, .CLIENT_PLUGIN_AUTH] // no CLIENT_SSL
+                        var packet = MySQLPacket()
+                        packet.payload.writeInteger(10, as: UInt8.self) // protocol version
+                        packet.payload.writeString("8.0.40\0")
+                        packet.payload.writeMultipleIntegers(
+                            1/*connection id*/, 0x6161_6161_6161_6161/*salt, part 1*/, 0/*filler*/, UInt16(truncatingIfNeeded: capabilities.rawValue),
+                            45/*utf8mb4_general_ci*/, 0x0002/*SERVER_STATUS_AUTOCOMMIT*/, UInt16(truncatingIfNeeded: capabilities.rawValue >> 16), 21/*salt length*/,
+                            endianness: .little, as: (UInt32, UInt64, UInt8, UInt16, UInt8, UInt16, UInt16, UInt8).self
+                        )
+                        packet.payload.writeRepeatingByte(0, count: 10) // reserved
+                        packet.payload.writeRepeatingByte(0x62, count: 12) // salt, part 2
+                        packet.payload.writeInteger(0, as: UInt8.self)
+                        packet.payload.writeString("mysql_native_password\0")
+                        self.send(packet, context: context)
+                    }
+                    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+                        var buffer = self.unwrapInboundIn(data)
+                        self.bytes.writeBuffer(&buffer)
+                        // Refuse whatever came, so a client that sent its login fails instead of waiting forever.
+                        var packet = MySQLPacket()
+                        packet.payload.writeMultipleIntegers(0xff/*flag*/, 1045/*ER_ACCESS_DENIED_ERROR*/, endianness: .little, as: (UInt8, UInt16).self)
+                        packet.payload.writeString("#28000Access denied")
+                        self.send(packet, context: context)
+                    }
+                    func channelInactive(context: ChannelHandlerContext) {
+                        self.received.succeed(self.bytes)
+                    }
+                    func send(_ packet: MySQLPacket, context: ChannelHandlerContext) {
+                        var buffer = ByteBuffer()
+                        try! MySQLPacketEncoder(sequence: .init(), logger: .init(label: "") { _ in SwiftLogNoOpLogHandler() }).encode(data: packet, out: &buffer) // Never actually throws
+                        context.writeAndFlush(self.wrapOutboundOut(buffer), promise: nil)
+                    }
+                }
+                return channel.eventLoop.makeCompletedFuture { try channel.pipeline.syncOperations.addHandler(Handler(received: received)) }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        await #expect(throws: MySQLError.secureConnectionRequired) {
+            let connection = try await MySQLConnection.connect(to: serverChannel.localAddress!, username: "user", database: "", password: "password", tlsConfiguration: .makeClientConfiguration(), on: .singletonMultiThreadedEventLoopGroup.any()).get()
+            try? await connection.close().get() // connection is *only* open if we get to this point
+        }
+        let bytes = try await received.futureResult.get()
+        #expect(bytes.readableBytes == 0 || bytes.readableBytesView.elementsEqual([0x01, 0x00, 0x00, 0x00, 0x01]), "the server got more than a COM_QUIT: \(bytes.hexDump(format: .plain))") // no login
+        try? await serverChannel.close(mode: .all)
+    }
+
+    @Test
+    func packetEncoder_splitsLargePayloads() throws {
+        // A payload of 0xFFFFFF bytes or more goes out as 0xFFFFFF-byte packets, each with its own header and sequence number,
+        // and then a shorter one, which is empty when the payload is exactly 0xFFFFFF bytes.
+        let encoder = MySQLPacketEncoder(sequence: .init(), logger: .init(label: "") { _ in SwiftLogNoOpLogHandler() })
+        for (size, rest) in [(0xFF_FF_FF + 10, 10), (0xFF_FF_FF, 0)] {
+            encoder.sequence.reset()
+            var out = ByteBuffer()
+            try encoder.encode(data: MySQLPacket(payload: ByteBuffer(repeating: 0x61, count: size)), out: &out)
+            #expect(out.readableBytes == size + 8)
+            #expect(out.getBytes(at: 0, length: 4) == [0xFF, 0xFF, 0xFF, 0x00])
+            #expect(out.getBytes(at: 4 + 0xFF_FF_FF, length: 4) == [UInt8(rest), 0x00, 0x00, 0x01])
+        }
+    }
+
+    @Test
+    func simpleQuery_statementLargerThanOnePacket() async throws {
+        let conn = try await MySQLConnection.test()
+
+        do {
+            // The server must get all 16 MiB: it either runs the statement or, past its max_allowed_packet, refuses all of it.
+            let rows = try await conn.simpleQuery("SELECT LENGTH('\(String(repeating: "a", count: 1 << 24))') AS n").get()
+            #expect(rows.first?.column("n")?.int == 1 << 24)
+        } catch MySQLError.server(let error) where error.errorCode == .NET_PACKET_TOO_LARGE {
+            // Refused whole: nothing ran.
+        } catch {
+            try? await conn.close().get()
+            throw error
+        }
+        try? await conn.close().get()
+    }
+
+    @Test
+    func packetDecoder_joinsLargePayloads() throws {
+        // A text row whose first value is 16 MiB starts with 0xFE, like the packet that ends a result set, and must not pass for one.
+        var row = ByteBuffer(bytes: [0xFE])
+        row.writeInteger(UInt64(1 << 24), endianness: .little)
+        row.writeRepeatingByte(0x61, count: 1 << 24)
+        for (payload, lastSequenceID) in [(row, 1), (ByteBuffer(repeating: 0x61, count: 0xFF_FF_FF), 1), (ByteBuffer(repeating: 0x62, count: 2 * 0xFF_FF_FF + 5), 2)] as [(ByteBuffer, UInt8)] {
+            let sequence = MySQLPacketSequence()
+            let channel = EmbeddedChannel(handler: ByteToMessageHandler(MySQLPacketDecoder(sequence: sequence, logger: .init(label: "") { _ in SwiftLogNoOpLogHandler() })))
+            var frames = ByteBuffer()
+            try MySQLPacketEncoder(sequence: .init(), logger: .init(label: "") { _ in SwiftLogNoOpLogHandler() }).encode(data: MySQLPacket(payload: payload), out: &frames)
+            try channel.writeInbound(frames.readSlice(length: 4 + 0xFF_FF_FF + 2)!) // up to the middle of the second packet's header
+            #expect(try channel.readInbound(as: MySQLPacket.self) == nil)
+            try channel.writeInbound(frames)
+            let packet = try #require(try channel.readInbound(as: MySQLPacket.self))
+            #expect(packet.payload == payload)
+            #expect(!packet.isEOF)
+            #expect(sequence.current == lastSequenceID)
+            _ = try channel.finish()
+        }
+        #expect(MySQLPacket(payload: ByteBuffer(bytes: [0xFE, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])).isEOF) // OK packet ending a result set
+    }
+
+    @Test
+    func query_rowLargerThanOnePacket() async throws {
+        let conn = try await MySQLConnection.test()
+
+        do {
+            // A server can only make a 16 MiB value if max_allowed_packet allows it (MySQL 5.7 defaults to 4 MiB).
+            if try await conn.simpleQuery("SELECT @@max_allowed_packet >= 16777216 AS fits").get().first?.column("fits")?.int == 1 {
+                _ = try await conn.simpleQuery("DROP TABLE IF EXISTS foos").get()
+                _ = try await conn.simpleQuery("CREATE TABLE foos (b LONGBLOB, id INT PRIMARY KEY)").get()
+                _ = try await conn.simpleQuery("INSERT INTO foos VALUES ('one', 1), (REPEAT('a', 16777216), 2), ('three', 3)").get()
+                func check(_ rows: [MySQLRow]) {
+                    #expect(rows.map { $0.column("id")?.int } == [1, 2, 3])
+                    #expect(rows.map { $0.column("b")?.buffer } == [ByteBuffer(string: "one"), ByteBuffer(repeating: 0x61, count: 1 << 24), ByteBuffer(string: "three")])
+                }
+                check(try await conn.simpleQuery("SELECT b, id FROM foos ORDER BY id").get())
+                check(try await conn.query("SELECT b, id FROM foos ORDER BY id").get())
+                _ = try await conn.simpleQuery("DROP TABLE IF EXISTS foos").get()
+            }
+        } catch {
+            _ = try? await conn.simpleQuery("DROP TABLE IF EXISTS foos").get()
+            try? await conn.close().get()
+            throw error
+        }
+        try await conn.close().get()
     }
 }
 
